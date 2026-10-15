@@ -1,0 +1,221 @@
+"""
+Credit Card Default Prediction & Risk Analysis System
+Dataset: UCI "Default of Credit Card Clients" (30,000 rows, Taiwan 2005)
+Run:  pip install streamlit pandas numpy scikit-learn matplotlib seaborn
+      streamlit run credit_default_app.py
+Place UCI_Credit_Card.csv next to this file (or upload it in the sidebar).
+"""
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, roc_curve,
+                             precision_recall_curve, confusion_matrix)
+
+st.set_page_config(page_title="Credit Default Risk", layout="wide")
+st.title("Credit Card Default Prediction & Risk Analysis")
+
+# ---------------------------------------------------------------- data
+@st.cache_data
+def load(file):
+    df = pd.read_csv(file)
+    df = df.rename(columns={"PAY_0": "PAY_1", "default.payment.next.month": "default",
+                            "default payment next month": "default"})
+    if "ID" in df.columns:
+        df = df.drop(columns="ID")
+    # clean undocumented category codes
+    df["EDUCATION"] = df["EDUCATION"].replace({0: 4, 5: 4, 6: 4})
+    df["MARRIAGE"] = df["MARRIAGE"].replace({0: 3})
+    return df
+
+up = st.sidebar.file_uploader("Upload UCI_Credit_Card.csv", type="csv")
+try:
+    df = load(up if up else "UCI_Credit_Card.csv")
+except FileNotFoundError:
+    st.warning("Upload the dataset in the sidebar (or put UCI_Credit_Card.csv next to this file).")
+    st.stop()
+
+FEATURES = [c for c in df.columns if c != "default"]
+X, y = df[FEATURES], df["default"]
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+
+# ---------------------------------------------------------------- models
+@st.cache_resource
+def train():
+    models = {
+        "Logistic Regression": make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight="balanced")),
+        "LDA": make_pipeline(StandardScaler(), LinearDiscriminantAnalysis()),
+        "Random Forest": RandomForestClassifier(n_estimators=200, min_samples_leaf=5,
+                                                class_weight="balanced", n_jobs=-1, random_state=42),
+    }
+    for m in models.values():
+        m.fit(X_tr, y_tr)
+    return models
+
+models = train()
+probas = {n: m.predict_proba(X_te)[:, 1] for n, m in models.items()}
+
+tabs = st.tabs(["Overview", "EDA", "Model comparison", "Risk prediction",
+                "Threshold analysis", "Explainability & ethics"])
+
+# ---------------------------------------------------------------- 1 overview
+with tabs[0]:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Customers", f"{len(df):,}")
+    c2.metric("Default rate", f"{y.mean():.1%}")
+    c3.metric("Avg credit limit", f"{df.LIMIT_BAL.mean():,.0f}")
+    fig, ax = plt.subplots(1, 2, figsize=(10, 3.5))
+    y.value_counts().sort_index().plot.bar(ax=ax[0], color=["#4c9", "#e55"])
+    ax[0].set_title("Class balance (0 = paid, 1 = default)")
+    df["PAY_1"].value_counts().sort_index().plot.bar(ax=ax[1])
+    ax[1].set_title("Latest repayment status (PAY_1)")
+    st.pyplot(fig)
+    st.caption("PAY_1: -2/-1 = paid in full or no use, 0 = revolving, 1+ = months of delay.")
+    st.dataframe(df.head(20))
+
+# ---------------------------------------------------------------- 2 EDA
+with tabs[1]:
+    fig, ax = plt.subplots(figsize=(10, 7))
+    sns.heatmap(df.corr(), cmap="coolwarm", center=0, ax=ax)
+    ax.set_title("Correlation heatmap")
+    st.pyplot(fig)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = plt.subplots()
+        df.groupby("PAY_1")["default"].mean().plot.bar(ax=ax, color="#e55")
+        ax.set_ylabel("Default rate"); ax.set_title("Default rate by latest repayment status")
+        st.pyplot(fig)
+    with c2:
+        fig, ax = plt.subplots()
+        sns.kdeplot(data=df, x="LIMIT_BAL", hue="default", common_norm=False, ax=ax)
+        ax.set_title("Credit limit distribution by outcome")
+        st.pyplot(fig)
+
+    pay_cols = ["PAY_1", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
+    fig, ax = plt.subplots()
+    df.groupby("default")[pay_cols].mean().T.plot(marker="o", ax=ax)
+    ax.set_title("Average repayment status over 6 months (PAY_1 = most recent)")
+    st.pyplot(fig)
+
+# ---------------------------------------------------------------- 3 comparison
+with tabs[2]:
+    rows = []
+    for n, p in probas.items():
+        pred = (p >= 0.5).astype(int)
+        rows.append({"Model": n, "Accuracy": accuracy_score(y_te, pred),
+                     "Precision": precision_score(y_te, pred), "Recall": recall_score(y_te, pred),
+                     "F1": f1_score(y_te, pred), "ROC-AUC": roc_auc_score(y_te, p)})
+    st.dataframe(pd.DataFrame(rows).set_index("Model").style.format("{:.3f}"))
+    fig, ax = plt.subplots()
+    for n, p in probas.items():
+        fpr, tpr, _ = roc_curve(y_te, p)
+        ax.plot(fpr, tpr, label=f"{n} (AUC {roc_auc_score(y_te, p):.3f})")
+    ax.plot([0, 1], [0, 1], "k--"); ax.legend(); ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
+    st.pyplot(fig)
+    st.caption("Accuracy alone is misleading here: ~78% of customers do not default, so predicting "
+               "'no default' for everyone already scores ~78%. Compare recall, F1 and AUC.")
+
+# ---------------------------------------------------------------- 4 prediction
+with tabs[3]:
+    model_name = st.selectbox("Model", list(models), index=2, key="pred_model")
+    idx = st.number_input("Test-set customer index", 0, len(X_te) - 1, 0)
+    rec = X_te.iloc[[int(idx)]].copy()
+    st.write("Adjust key fields to run a what-if:")
+    c1, c2, c3 = st.columns(3)
+    rec["LIMIT_BAL"] = c1.slider("Credit limit", 10000, 1000000, int(rec.LIMIT_BAL.iloc[0]), 10000)
+    rec["PAY_1"] = c2.slider("Latest repayment status", -2, 8, int(rec.PAY_1.iloc[0]))
+    rec["PAY_AMT1"] = c3.slider("Last payment amount", 0, 200000, int(min(rec.PAY_AMT1.iloc[0], 200000)), 1000)
+    p = models[model_name].predict_proba(rec)[0, 1]
+    st.metric("Predicted default probability", f"{p:.1%}")
+    st.progress(min(float(p), 1.0))
+    st.write("Actual outcome:", "Default" if y_te.iloc[int(idx)] == 1 else "Paid")
+    st.dataframe(rec.T.rename(columns={rec.index[0]: "value"}))
+
+# ---------------------------------------------------------------- 5 threshold
+with tabs[4]:
+    model_name = st.selectbox("Model", list(models), index=2, key="thr_model")
+    p = probas[model_name]
+    t = st.slider("Classification threshold", 0.05, 0.95, 0.50, 0.01)
+    pred = (p >= t).astype(int)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Precision", f"{precision_score(y_te, pred, zero_division=0):.3f}")
+    c2.metric("Recall", f"{recall_score(y_te, pred):.3f}")
+    c3.metric("F1", f"{f1_score(y_te, pred):.3f}")
+    c4.metric("Flagged as risky", f"{pred.mean():.1%}")
+
+    pr, rc, th = precision_recall_curve(y_te, p)
+    fig, ax = plt.subplots(1, 2, figsize=(11, 3.8))
+    ax[0].plot(th, pr[:-1], label="Precision"); ax[0].plot(th, rc[:-1], label="Recall")
+    ax[0].axvline(t, color="k", ls="--"); ax[0].legend(); ax[0].set_xlabel("Threshold")
+    sns.heatmap(confusion_matrix(y_te, pred), annot=True, fmt="d", cmap="Blues", ax=ax[1],
+                xticklabels=["Pred paid", "Pred default"], yticklabels=["Paid", "Default"])
+    st.pyplot(fig)
+
+    st.subheader("Business cost view")
+    c1, c2 = st.columns(2)
+    fn_cost = c1.number_input("Cost of a missed default (FN)", value=10000)
+    fp_cost = c2.number_input("Cost of wrongly rejecting a good customer (FP)", value=1000)
+    ths = np.linspace(0.05, 0.95, 91)
+    costs = [fn_cost * ((p < x) & (y_te == 1)).sum() + fp_cost * ((p >= x) & (y_te == 0)).sum() for x in ths]
+    best = ths[int(np.argmin(costs))]
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(ths, costs); ax.axvline(best, color="g", ls="--"); ax.axvline(t, color="k", ls="--")
+    ax.set_xlabel("Threshold"); ax.set_ylabel("Total cost")
+    st.pyplot(fig)
+    st.info(f"Lowest-cost threshold under these costs: **{best:.2f}** (green line).")
+
+# ---------------------------------------------------------------- 6 explain/ethics
+with tabs[5]:
+    st.subheader("Feature importance")
+    rf = models["Random Forest"]
+    imp = pd.Series(rf.feature_importances_, index=FEATURES).sort_values().tail(12)
+    lr = models["Logistic Regression"][-1]
+    coef = pd.Series(lr.coef_[0], index=FEATURES).sort_values()
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = plt.subplots(); imp.plot.barh(ax=ax); ax.set_title("Random Forest importance")
+        st.pyplot(fig)
+    with c2:
+        fig, ax = plt.subplots(); pd.concat([coef.head(6), coef.tail(6)]).plot.barh(ax=ax)
+        ax.set_title("Logistic Regression coefficients (standardized)")
+        st.pyplot(fig)
+
+    if st.checkbox("Compute permutation importance (slower, more reliable)"):
+        sub = X_te.sample(2000, random_state=0)
+        r = permutation_importance(rf, sub, y_te.loc[sub.index], scoring="roc_auc",
+                                   n_repeats=5, random_state=0, n_jobs=-1)
+        st.bar_chart(pd.Series(r.importances_mean, index=FEATURES).sort_values().tail(10))
+
+    st.subheader("Fairness check by group (Random Forest)")
+    thr = st.slider("Threshold for fairness check", 0.05, 0.95, 0.5, 0.01, key="fair_thr")
+    te = X_te.copy(); te["y"] = y_te; te["pred"] = (probas["Random Forest"] >= thr).astype(int)
+    te["Age group"] = pd.cut(te.AGE, [20, 30, 40, 50, 80])
+    te["Sex"] = te.SEX.map({1: "Male", 2: "Female"})
+    for g in ["Sex", "EDUCATION", "Age group"]:
+        out = te.groupby(g, observed=True).apply(lambda d: pd.Series({
+            "n": len(d), "actual default rate": d.y.mean(),
+            "flagged rate": d.pred.mean(),
+            "recall": recall_score(d.y, d.pred) if d.y.sum() else np.nan,
+            "false positive rate": ((d.pred == 1) & (d.y == 0)).sum() / max((d.y == 0).sum(), 1)}))
+        st.write(f"**By {g}**"); st.dataframe(out.style.format({"n": "{:.0f}", **{c: "{:.3f}" for c in out.columns[1:]}}))
+
+    st.subheader("Limitations & ethics")
+    st.markdown("""
+- **Old, single-country data** (Taiwan, 2005): patterns may not transfer to other markets or today's lending.
+- **Class imbalance**: defaults are ~22%; accuracy hides weak recall. Balanced class weights trade precision for recall.
+- **Sensitive attributes** (sex, age, marriage, education) can cause disparate impact. Even if removed, other features can act as proxies.
+- **Correlation, not causation**: a high feature importance does not mean it causes default.
+- **Threshold is a policy choice**: lowering it catches more defaulters but rejects more good customers. Humans should set it, with the costs made explicit.
+- **Human oversight and appeal**: automated decisions about credit should be explainable and contestable.
+- **Not for real lending**: this is an educational project, not a validated credit-scoring system.
+""")
